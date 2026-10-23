@@ -2,11 +2,13 @@ package com.example
 
 import android.Manifest
 import android.content.Intent
+import android.content.ClipData
 import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.os.Handler
+import android.os.PowerManager
 import android.os.Looper
 import android.provider.Settings
 import android.widget.Toast
@@ -36,6 +38,9 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.content.FileProvider
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
+import androidx.lifecycle.compose.LocalLifecycleOwner
 import com.example.ui.theme.MyApplicationTheme
 import kotlinx.coroutines.delay
 import java.io.File
@@ -127,6 +132,19 @@ fun AudioRecorderApp(
         permissionLauncher.launch(permissionsToRequest.toTypedArray())
     }
 
+    // Refresh saved segments when returning from Settings or another app.
+    val lifecycleOwner = LocalLifecycleOwner.current
+    DisposableEffect(lifecycleOwner) {
+        val observer = LifecycleEventObserver { _, event ->
+            if (event == Lifecycle.Event.ON_RESUME) {
+                recordingsList = dbHelper.getAllRecordings()
+                totalStorageSize = fileManager.formatFileSize(fileManager.calculateTotalDirectorySize())
+            }
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
+    }
+
     fun refreshData() {
         onRefreshTriggered()
         recordingsList = dbHelper.getAllRecordings()
@@ -172,7 +190,7 @@ fun AudioRecorderApp(
             totalPlaybackDuration = dur.toFloat().coerceAtLeast(1f)
         }
         totalPlaybackDuration = playbackManager.getDuration().toFloat().coerceAtLeast(1f)
-        isPlaying = true
+        // Async MediaPlayer preparation updates isPlaying via onPlaybackStateChanged.
     }
 
     val estimates = settings.calculateEstimatedSizes(selectedQuality.bitrate)
@@ -404,8 +422,10 @@ fun AudioRecorderApp(
                                 if (file.exists()) {
                                     val uri = FileProvider.getUriForFile(context, "${context.packageName}.fileprovider", file)
                                     val shareIntent = Intent(Intent.ACTION_SEND).apply {
-                                        type = "audio/m4a"
+                                        // M4A/AAC is audio/mp4. audio/m4a is not recognized by every receiver.
+                                        type = "audio/mp4"
                                         putExtra(Intent.EXTRA_STREAM, uri)
+                                        clipData = ClipData.newUri(context.contentResolver, file.name, uri)
                                         addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
                                     }
                                     context.startActivity(Intent.createChooser(shareIntent, "مشاركة التسجيل"))
