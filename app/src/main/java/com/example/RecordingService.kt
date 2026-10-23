@@ -13,6 +13,7 @@ import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
 import android.os.PowerManager
+import android.util.Log
 import androidx.core.app.NotificationCompat
 import java.io.File
 import java.io.IOException
@@ -21,25 +22,26 @@ import java.util.Date
 import java.util.Locale
 
 class RecordingService : Service() {
-
     private var mediaRecorder: MediaRecorder? = null
-    private var currentFilePath: String = ""
-    private var currentFileName: String = ""
-    private var recordingStartTime: Long = 0
+    private var currentFilePath = ""
+    private var currentFileName = ""
+    private var recordingStartTime = 0L
     private var wakeLock: PowerManager.WakeLock? = null
     private val handler = Handler(Looper.getMainLooper())
     private var segmentRunnable: Runnable? = null
+    private var isRecording = false
     private lateinit var dbHelper: DatabaseHelper
     private lateinit var fileManager: RecordingFileManager
     private lateinit var settings: RecordingSettings
 
     companion object {
-        const val ACTION_START = "ACTION_START"
-        const val ACTION_STOP = "ACTION_STOP"
-        private const val CHANNEL_ID = "RecordingServiceChannel"
-        private const val NOTIFICATION_ID = 101
-        // 30 minutes in milliseconds = 1,800,000 ms
+        const val ACTION_START = "com.example.action.START_RECORDING"
+        const val ACTION_STOP = "com.example.action.STOP_RECORDING"
+        const val ACTION_STATUS = "com.example.action.RECORDING_STATUS"
         const val SEGMENT_DURATION_MS = 30 * 60 * 1000L
+        private const val CHANNEL_ID = "continuous_recording_channel"
+        private const val NOTIFICATION_ID = 101
+        private const val TAG = "RecordingService"
     }
 
     override fun onCreate() {
@@ -48,181 +50,222 @@ class RecordingService : Service() {
         fileManager = RecordingFileManager(this)
         settings = RecordingSettings(this)
         createNotificationChannel()
-
-        val powerManager = getSystemService(Context.POWER_SERVICE) as PowerManager
-        wakeLock = powerManager.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "AudioRecorder::WakelockTag").apply {
-            acquire(35 * 60 * 1000L) // 35 minutes safety acquire
-        }
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         when (intent?.action) {
-            ACTION_START -> startRecordingService()
             ACTION_STOP -> stopRecordingService()
+            ACTION_START -> startRecordingService()
+            else -> if (!isRecording && mediaRecorder == null) {
+                // A sticky service restart must not silently start recording without a fresh,
+                // user-authorized action on newer Android versions.
+                stopSelf(startId)
+            }
         }
-        return START_STICKY
+        return START_NOT_STICKY
     }
 
     private fun startRecordingService() {
-        val notification = createNotification("التسجيل الصوتي قيد العمل في الخلفية...")
-        startForeground(NOTIFICATION_ID, notification)
+        if (isRecording) {
+            updateNotification("التسجيل مستمر في الخلفية")
+            return
+        }
 
-        startNewSegment()
+        // Enter foreground immediately; this service is started by the visible user action.
+        startForeground(NOTIFICATION_ID, createNotification("جارٍ بدء التسجيل..."))
+        try {
+            acquireWakeLock()
+            startNewSegment()
+            isRecording = true
+            updateNotification("التسجيل مستمر في الخلفية • تقسيم كل 30 دقيقة")
+            scheduleNextSegment()
+        } catch (e: Exception) {
+            Log.e(TAG, "Could not start recording", e)
+            stopAndSaveCurrentSegment()
+            releaseWakeLock()
+            isRecording = false
+            stopForeground(STOP_FOREGROUND_REMOVE)
+            stopSelf()
+        }
+    }
 
-        segmentRunnable = object : Runnable {
+    private fun acquireWakeLock() {
+        if (wakeLock?.isHeld == true) return
+        val powerManager = getSystemService(Context.POWER_SERVICE) as PowerManager
+        wakeLock = powerManager.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "$packageName:ContinuousRecording").apply {
+            setReferenceCounted(false)
+            // Keep the CPU awake for the full recording session; release only when recording stops.
+            acquire()
+        }
+    }
+
+    private fun scheduleNextSegment() {
+        segmentRunnable?.let(handler::removeCallbacks)
+        val task = object : Runnable {
             override fun run() {
+                if (!isRecording) return
                 stopAndSaveCurrentSegment()
-                startNewSegment()
-                handler.postDelayed(this, SEGMENT_DURATION_MS)
+                try {
+                    startNewSegment()
+                    updateNotification("التسجيل مستمر في الخلفية • ملف جديد")
+                    handler.postDelayed(this, SEGMENT_DURATION_MS)
+                } catch (e: Exception) {
+                    Log.e(TAG, "Could not rotate recording segment", e)
+                    stopRecordingService()
+                }
             }
         }
-        handler.postDelayed(segmentRunnable!!, SEGMENT_DURATION_MS)
+        segmentRunnable = task
+        handler.postDelayed(task, SEGMENT_DURATION_MS)
     }
 
     private fun startNewSegment() {
-        try {
-            mediaRecorder?.release()
-        } catch (e: Exception) {
-            e.printStackTrace()
-        }
-
-        val qualityMode = settings.getSelectedQualityMode()
+        val quality = settings.getSelectedQualityMode()
         val file = fileManager.createNewSegmentFile()
         currentFilePath = file.absolutePath
         currentFileName = file.name
         recordingStartTime = System.currentTimeMillis()
 
-        mediaRecorder = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-            MediaRecorder(this)
-        } else {
+        val recorder = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) MediaRecorder(this) else {
             @Suppress("DEPRECATION")
             MediaRecorder()
-        }.apply {
-            setAudioSource(MediaRecorder.AudioSource.MIC)
-            setOutputFormat(MediaRecorder.OutputFormat.MPEG_4)
-            setAudioEncoder(MediaRecorder.AudioEncoder.AAC)
-            setAudioEncodingBitRate(qualityMode.bitrate)
-            setAudioSamplingRate(qualityMode.sampleRate)
-            setOutputFile(currentFilePath)
-            try {
+        }
+        try {
+            recorder.apply {
+                setAudioSource(MediaRecorder.AudioSource.MIC)
+                setOutputFormat(MediaRecorder.OutputFormat.MPEG_4)
+                setAudioEncoder(MediaRecorder.AudioEncoder.AAC)
+                setAudioChannels(1)
+                setAudioEncodingBitRate(quality.bitrate)
+                setAudioSamplingRate(quality.sampleRate)
+                setOutputFile(currentFilePath)
                 prepare()
                 start()
-            } catch (e: IOException) {
-                e.printStackTrace()
             }
+            mediaRecorder = recorder
+        } catch (e: Exception) {
+            try { recorder.reset() } catch (_: Exception) {}
+            try { recorder.release() } catch (_: Exception) {}
+            File(currentFilePath).takeIf { it.exists() && it.length() == 0L }?.delete()
+            currentFilePath = ""
+            currentFileName = ""
+            throw e
         }
     }
 
     private fun stopAndSaveCurrentSegment() {
+        val recorder = mediaRecorder ?: return
+        mediaRecorder = null
         try {
-            mediaRecorder?.stop()
-            mediaRecorder?.release()
-            mediaRecorder = null
-
-            val file = File(currentFilePath)
-            if (file.exists() && file.length() > 0) {
-                val durationMs = System.currentTimeMillis() - recordingStartTime
-                val durationFormatted = formatDuration(durationMs)
-                val fileSizeFormatted = fileManager.formatFileSize(file.length())
-
-                val displayDate = SimpleDateFormat("yyyy-MM-dd", Locale.getDefault()).format(Date(recordingStartTime))
-                val displayTime = SimpleDateFormat("HH:mm:ss", Locale.getDefault()).format(Date(recordingStartTime))
-
-                dbHelper.insertRecording(
-                    fileName = currentFileName,
-                    filePath = currentFilePath,
-                    date = displayDate,
-                    startTime = displayTime,
-                    duration = durationFormatted,
-                    fileSize = fileSizeFormatted
-                )
-            }
-        } catch (e: Exception) {
-            e.printStackTrace()
+            recorder.stop()
+        } catch (e: RuntimeException) {
+            Log.w(TAG, "Recorder stopped before producing a valid segment", e)
+        } finally {
+            try { recorder.reset() } catch (_: Exception) {}
+            try { recorder.release() } catch (_: Exception) {}
         }
+
+        val path = currentFilePath
+        val name = currentFileName
+        val startedAt = recordingStartTime
+        currentFilePath = ""
+        currentFileName = ""
+        recordingStartTime = 0L
+        if (path.isBlank()) return
+
+        val file = File(path)
+        if (!file.isFile || file.length() < 512L) {
+            file.delete()
+            return
+        }
+        val duration = (System.currentTimeMillis() - startedAt).coerceAtLeast(0L)
+        val date = SimpleDateFormat("yyyy-MM-dd", Locale.US).format(Date(startedAt))
+        val time = SimpleDateFormat("HH:mm:ss", Locale.US).format(Date(startedAt))
+        val inserted = dbHelper.insertRecording(
+            fileName = name,
+            filePath = path,
+            date = date,
+            startTime = time,
+            duration = formatDuration(duration),
+            fileSize = fileManager.formatFileSize(file.length())
+        )
+        if (inserted < 0L) Log.e(TAG, "Failed to save recording metadata for $path")
     }
 
     private fun stopRecordingService() {
-        segmentRunnable?.let { handler.removeCallbacks(it) }
+        isRecording = false
+        segmentRunnable?.let(handler::removeCallbacks)
+        segmentRunnable = null
         stopAndSaveCurrentSegment()
-
-        try {
-            wakeLock?.let {
-                if (it.isHeld) {
-                    it.release()
-                }
-            }
-        } catch (e: Exception) {
-            e.printStackTrace()
-        }
-
+        releaseWakeLock()
         stopForeground(STOP_FOREGROUND_REMOVE)
         stopSelf()
     }
 
+    private fun releaseWakeLock() {
+        try {
+            wakeLock?.let { if (it.isHeld) it.release() }
+        } catch (e: Exception) {
+            Log.w(TAG, "Unable to release wake lock", e)
+        }
+        wakeLock = null
+    }
+
+    private fun updateNotification(message: String) {
+        val manager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+        manager.notify(NOTIFICATION_ID, createNotification(message))
+    }
+
     private fun formatDuration(ms: Long): String {
         val seconds = (ms / 1000) % 60
-        val minutes = (ms / (1000 * 60)) % 60
-        val hours = ms / (1000 * 60 * 60)
-        return if (hours > 0) {
-            String.format(Locale.getDefault(), "%02d:%02d:%02d", hours, minutes, seconds)
-        } else {
-            String.format(Locale.getDefault(), "%02d:%02d", minutes, seconds)
-        }
+        val minutes = (ms / 60_000) % 60
+        val hours = ms / 3_600_000
+        return if (hours > 0) String.format(Locale.US, "%02d:%02d:%02d", hours, minutes, seconds)
+        else String.format(Locale.US, "%02d:%02d", minutes, seconds)
     }
 
     private fun createNotificationChannel() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            val serviceChannel = NotificationChannel(
-                CHANNEL_ID,
-                "قناة خدمة التسجيل الصوتي",
-                NotificationManager.IMPORTANCE_LOW
-            )
-            val manager = getSystemService(NotificationManager::class.java)
-            manager?.createNotificationChannel(serviceChannel)
+            val channel = NotificationChannel(CHANNEL_ID, "التسجيل الصوتي المستمر", NotificationManager.IMPORTANCE_LOW)
+            (getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager).createNotificationChannel(channel)
         }
     }
 
     private fun createNotification(message: String): Notification {
-        val notificationIntent = Intent(this, MainActivity::class.java)
-        val pendingIntent = PendingIntent.getActivity(
-            this, 0, notificationIntent,
-            PendingIntent.FLAG_IMMUTABLE
+        val openIntent = Intent(this, MainActivity::class.java)
+        val openPendingIntent = PendingIntent.getActivity(
+            this, 0, openIntent,
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
         )
-
-        val stopIntent = Intent(this, RecordingService::class.java).apply {
-            action = ACTION_STOP
-        }
+        val stopIntent = Intent(this, RecordingService::class.java).setAction(ACTION_STOP)
         val stopPendingIntent = PendingIntent.getService(
-            this, 0, stopIntent,
-            PendingIntent.FLAG_IMMUTABLE
+            this, 1, stopIntent,
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
         )
-
         return NotificationCompat.Builder(this, CHANNEL_ID)
-            .setContentTitle("المسجل الصوتي قيد التشغيل")
+            .setContentTitle("المسجل الصوتي المستمر")
             .setContentText(message)
             .setSmallIcon(android.R.drawable.ic_btn_speak_now)
-            .setContentIntent(pendingIntent)
+            .setContentIntent(openPendingIntent)
             .addAction(android.R.drawable.ic_menu_close_clear_cancel, "إيقاف", stopPendingIntent)
-            .setOngoing(true)
+            .setOngoing(isRecording || mediaRecorder != null)
+            .setOnlyAlertOnce(true)
             .build()
     }
 
-    override fun onBind(intent: Intent?): IBinder? {
-        return null
+    override fun onBind(intent: Intent?): IBinder? = null
+
+    override fun onTaskRemoved(rootIntent: Intent?) {
+        // Do not stop an active foreground recording when the app task is swiped away.
+        super.onTaskRemoved(rootIntent)
     }
 
     override fun onDestroy() {
-        super.onDestroy()
+        isRecording = false
+        segmentRunnable?.let(handler::removeCallbacks)
+        segmentRunnable = null
         stopAndSaveCurrentSegment()
-        try {
-            wakeLock?.let {
-                if (it.isHeld) {
-                    it.release()
-                }
-            }
-        } catch (e: Exception) {
-            e.printStackTrace()
-        }
+        releaseWakeLock()
+        super.onDestroy()
     }
 }
