@@ -1,5 +1,6 @@
 package com.example
 
+import android.app.AlarmManager
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
@@ -7,12 +8,14 @@ import android.app.PendingIntent
 import android.app.Service
 import android.content.Context
 import android.content.Intent
+import android.content.pm.ServiceInfo
 import android.media.MediaRecorder
 import android.os.Build
 import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
 import android.os.PowerManager
+import android.os.SystemClock
 import android.util.Log
 import androidx.core.app.NotificationCompat
 import java.io.File
@@ -38,7 +41,9 @@ class RecordingService : Service() {
         const val ACTION_START = "com.example.action.START_RECORDING"
         const val ACTION_STOP = "com.example.action.STOP_RECORDING"
         const val ACTION_STATUS = "com.example.action.RECORDING_STATUS"
+        const val ACTION_HEARTBEAT_CHECK = "com.example.action.HEARTBEAT_CHECK"
         const val SEGMENT_DURATION_MS = 30 * 60 * 1000L
+        private const val HEARTBEAT_INTERVAL_MS = 15 * 60 * 1000L // 15 minutes watchdog
         private const val CHANNEL_ID = "continuous_recording_channel"
         private const val NOTIFICATION_ID = 101
         private const val TAG = "RecordingService"
@@ -56,13 +61,16 @@ class RecordingService : Service() {
         when (intent?.action) {
             ACTION_STOP -> stopRecordingService()
             ACTION_START -> startRecordingService()
+            ACTION_HEARTBEAT_CHECK -> {
+                if (isRecording) {
+                    scheduleWatchdogHeartbeat()
+                }
+            }
             else -> if (!isRecording && mediaRecorder == null) {
-                // A sticky service restart must not silently start recording without a fresh,
-                // user-authorized action on newer Android versions.
                 stopSelf(startId)
             }
         }
-        return START_NOT_STICKY
+        return START_STICKY
     }
 
     private fun startRecordingService() {
@@ -71,19 +79,27 @@ class RecordingService : Service() {
             return
         }
 
-        // Enter foreground immediately; this service is started by the visible user action.
-        startForeground(NOTIFICATION_ID, createNotification("جارٍ بدء التسجيل..."))
+        val notification = createNotification("جارٍ بدء التسجيل...")
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            startForeground(NOTIFICATION_ID, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE)
+        } else {
+            startForeground(NOTIFICATION_ID, notification)
+        }
+
         try {
             acquireWakeLock()
             startNewSegment()
             isRecording = true
+            RecordingStateHolder.onRecordingStarted(currentFileName, recordingStartTime)
             updateNotification("التسجيل مستمر في الخلفية • تقسيم كل 30 دقيقة")
             scheduleNextSegment()
+            scheduleWatchdogHeartbeat()
         } catch (e: Exception) {
             Log.e(TAG, "Could not start recording", e)
             stopAndSaveCurrentSegment()
             releaseWakeLock()
             isRecording = false
+            RecordingStateHolder.onError(e.localizedMessage ?: "فشل بدء التسجيل")
             stopForeground(STOP_FOREGROUND_REMOVE)
             stopSelf()
         }
@@ -94,9 +110,51 @@ class RecordingService : Service() {
         val powerManager = getSystemService(Context.POWER_SERVICE) as PowerManager
         wakeLock = powerManager.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "$packageName:ContinuousRecording").apply {
             setReferenceCounted(false)
-            // Keep the CPU awake for the full recording session; release only when recording stops.
             acquire()
         }
+    }
+
+    private fun scheduleWatchdogHeartbeat() {
+        if (!isRecording) return
+        val alarmManager = getSystemService(Context.ALARM_SERVICE) as? AlarmManager ?: return
+        val intent = Intent(this, BootReceiver::class.java).apply {
+            action = BootReceiver.ACTION_HEARTBEAT
+        }
+        val pendingIntent = PendingIntent.getBroadcast(
+            this,
+            102,
+            intent,
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
+        val triggerAtMillis = SystemClock.elapsedRealtime() + HEARTBEAT_INTERVAL_MS
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+            alarmManager.setExactAndAllowWhileIdle(
+                AlarmManager.ELAPSED_REALTIME_WAKEUP,
+                triggerAtMillis,
+                pendingIntent
+            )
+        } else {
+            alarmManager.setExact(
+                AlarmManager.ELAPSED_REALTIME_WAKEUP,
+                triggerAtMillis,
+                pendingIntent
+            )
+        }
+    }
+
+    private fun cancelWatchdogHeartbeat() {
+        val alarmManager = getSystemService(Context.ALARM_SERVICE) as? AlarmManager ?: return
+        val intent = Intent(this, BootReceiver::class.java).apply {
+            action = BootReceiver.ACTION_HEARTBEAT
+        }
+        val pendingIntent = PendingIntent.getBroadcast(
+            this,
+            102,
+            intent,
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
+        alarmManager.cancel(pendingIntent)
     }
 
     private fun scheduleNextSegment() {
@@ -107,8 +165,10 @@ class RecordingService : Service() {
                 stopAndSaveCurrentSegment()
                 try {
                     startNewSegment()
+                    RecordingStateHolder.onSegmentRotated(currentFileName, recordingStartTime)
                     updateNotification("التسجيل مستمر في الخلفية • ملف جديد")
                     handler.postDelayed(this, SEGMENT_DURATION_MS)
+                    scheduleWatchdogHeartbeat()
                 } catch (e: Exception) {
                     Log.e(TAG, "Could not rotate recording segment", e)
                     stopRecordingService()
@@ -194,8 +254,10 @@ class RecordingService : Service() {
 
     private fun stopRecordingService() {
         isRecording = false
+        RecordingStateHolder.onRecordingStopped()
         segmentRunnable?.let(handler::removeCallbacks)
         segmentRunnable = null
+        cancelWatchdogHeartbeat()
         stopAndSaveCurrentSegment()
         releaseWakeLock()
         stopForeground(STOP_FOREGROUND_REMOVE)
@@ -221,7 +283,7 @@ class RecordingService : Service() {
         val minutes = (ms / 60_000) % 60
         val hours = ms / 3_600_000
         return if (hours > 0) String.format(Locale.US, "%02d:%02d:%02d", hours, minutes, seconds)
-        else String.format(Locale.US, "%02d:%02d", minutes, seconds)
+        else String.format(Locale.US, "%02d:%02d:%02d", minutes, seconds)
     }
 
     private fun createNotificationChannel() {
@@ -256,14 +318,18 @@ class RecordingService : Service() {
     override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onTaskRemoved(rootIntent: Intent?) {
-        // Do not stop an active foreground recording when the app task is swiped away.
         super.onTaskRemoved(rootIntent)
+        if (isRecording) {
+            scheduleWatchdogHeartbeat()
+        }
     }
 
     override fun onDestroy() {
         isRecording = false
+        RecordingStateHolder.onRecordingStopped()
         segmentRunnable?.let(handler::removeCallbacks)
         segmentRunnable = null
+        cancelWatchdogHeartbeat()
         stopAndSaveCurrentSegment()
         releaseWakeLock()
         super.onDestroy()

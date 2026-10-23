@@ -2,6 +2,7 @@ package com.example
 
 import android.content.Context
 import android.os.Environment
+import android.os.StatFs
 import java.io.File
 import java.text.SimpleDateFormat
 import java.util.Date
@@ -40,6 +41,21 @@ class RecordingFileManager(private val context: Context) {
         return File(todayDir, fileName)
     }
 
+    fun renameRecordingFile(oldFilePath: String, newCustomName: String): Pair<String, String>? {
+        val oldFile = File(oldFilePath)
+        if (!oldFile.exists() || !oldFile.isFile) return null
+
+        val sanitized = newCustomName.trim().replace(Regex("[^a-zA-Z0-9_\\-\\u0600-\\u06FF]"), "_")
+        val finalFileName = if (sanitized.endsWith(".m4a", ignoreCase = true)) sanitized else "$sanitized.m4a"
+        val newFile = File(oldFile.parentFile, finalFileName)
+
+        return if (oldFile.renameTo(newFile)) {
+            Pair(finalFileName, newFile.absolutePath)
+        } else {
+            null
+        }
+    }
+
     fun formatFileSize(sizeBytes: Long): String {
         val kb = sizeBytes / 1024.0
         val mb = kb / 1024.0
@@ -54,6 +70,16 @@ class RecordingFileManager(private val context: Context) {
     fun calculateTotalDirectorySize(): Long {
         val root = getRootDirectory()
         return getFolderSizeRecursive(root)
+    }
+
+    fun getAvailableStorageBytes(): Long {
+        return try {
+            val root = getRootDirectory()
+            val stat = StatFs(root.path)
+            stat.availableBlocksLong * stat.blockSizeLong
+        } catch (e: Exception) {
+            -1L
+        }
     }
 
     private fun getFolderSizeRecursive(file: File): Long {
