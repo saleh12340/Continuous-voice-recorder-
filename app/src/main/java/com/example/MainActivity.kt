@@ -71,6 +71,8 @@ class MainActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        // STEP 1: Configure App Check with launch intent before any UI or Firebase operations
+        configureAppCheck(this, intent)
         enableEdgeToEdge()
 
         dbHelper = DatabaseHelper(this)
@@ -153,10 +155,12 @@ fun AudioRecorderApp(
     var totalPlaybackDuration by remember { mutableFloatStateOf(1f) }
     var currentPlayingTitle by remember { mutableStateOf("") }
 
-    // Dialogs state
+    // Dialogs and AI state
+    val aiViewModel: RecordingAiViewModel = androidx.lifecycle.viewmodel.compose.viewModel()
     var itemToRename by remember { mutableStateOf<RecordingModel?>(null) }
     var renameInput by remember { mutableStateOf("") }
     var itemForDetails by remember { mutableStateOf<RecordingModel?>(null) }
+    var itemForAi by remember { mutableStateOf<RecordingModel?>(null) }
     var showAdvancedSettingsDialog by remember { mutableStateOf(false) }
     var showExitConfirmDialog by remember { mutableStateOf(false) }
 
@@ -709,6 +713,9 @@ fun AudioRecorderApp(
                                 itemToRename = item
                                 renameInput = item.fileName.removeSuffix(".m4a").removeSuffix(".3gp")
                             },
+                            onAiClick = {
+                                itemForAi = item
+                            },
                             onInfoClick = {
                                 itemForDetails = item
                             },
@@ -915,6 +922,19 @@ fun AudioRecorderApp(
             }
         )
     }
+
+    // Gemini AI Dialog
+    itemForAi?.let { recording ->
+        RecordingAiDialog(
+            recording = recording,
+            viewModel = aiViewModel,
+            onDismiss = { itemForAi = null },
+            onSaveSummaryToDb = { summary ->
+                dbHelper.updateRecordingAiSummary(recording.id, summary)
+                refreshData()
+            }
+        )
+    }
 }
 
 @Composable
@@ -924,6 +944,7 @@ fun RecordingItemCard(
     onPlayClick: () -> Unit,
     onShareClick: () -> Unit,
     onRenameClick: () -> Unit,
+    onAiClick: () -> Unit,
     onInfoClick: () -> Unit,
     onDeleteClick: () -> Unit
 ) {
@@ -960,6 +981,35 @@ fun RecordingItemCard(
                         fontSize = 10.sp,
                         fontWeight = FontWeight.Medium
                     )
+
+                    // Saved AI summary badge
+                    if (!item.aiSummary.isNullOrBlank()) {
+                        Surface(
+                            shape = RoundedCornerShape(4.dp),
+                            color = Color(0xFF0284C7).copy(alpha = 0.25f),
+                            modifier = Modifier.padding(top = 2.dp),
+                            onClick = onAiClick
+                        ) {
+                            Row(
+                                modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(4.dp)
+                            ) {
+                                Icon(
+                                    imageVector = AppIcons.AutoAwesome,
+                                    contentDescription = null,
+                                    tint = Color(0xFF38BDF8),
+                                    modifier = Modifier.size(11.dp)
+                                )
+                                Text(
+                                    text = "ملخص الذكاء الاصطناعي محفوظ (عرض)",
+                                    color = Color(0xFF38BDF8),
+                                    fontSize = 9.sp,
+                                    fontWeight = FontWeight.Medium
+                                )
+                            }
+                        }
+                    }
                 }
 
                 Row(
@@ -971,6 +1021,13 @@ fun RecordingItemCard(
                             imageVector = if (isPlaying) AppIcons.Stop else Icons.Default.PlayArrow,
                             contentDescription = "تشغيل/إيقاف",
                             tint = if (isPlaying) Color(0xFF4ADE80) else Color.White
+                        )
+                    }
+                    IconButton(onClick = onAiClick, modifier = Modifier.size(34.dp)) {
+                        Icon(
+                            imageVector = AppIcons.AutoAwesome,
+                            contentDescription = "تحليل وتلخيص بالذكاء الاصطناعي Gemini",
+                            tint = Color(0xFF38BDF8)
                         )
                     }
                     IconButton(onClick = onShareClick, modifier = Modifier.size(34.dp)) {

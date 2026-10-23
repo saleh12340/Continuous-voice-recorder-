@@ -14,7 +14,8 @@ data class RecordingModel(
     val date: String,
     val startTime: String,
     val duration: String,
-    val fileSize: String
+    val fileSize: String,
+    val aiSummary: String? = null
 )
 
 class DatabaseHelper(context: Context) : SQLiteOpenHelper(context, DATABASE_NAME, null, DATABASE_VERSION) {
@@ -22,7 +23,7 @@ class DatabaseHelper(context: Context) : SQLiteOpenHelper(context, DATABASE_NAME
     companion object {
         private const val TAG = "DatabaseHelper"
         private const val DATABASE_NAME = "audio_recordings.db"
-        private const val DATABASE_VERSION = 1
+        private const val DATABASE_VERSION = 2
 
         const val TABLE_RECORDINGS = "recordings"
         const val COLUMN_ID = "id"
@@ -32,6 +33,7 @@ class DatabaseHelper(context: Context) : SQLiteOpenHelper(context, DATABASE_NAME
         const val COLUMN_START_TIME = "start_time"
         const val COLUMN_DURATION = "duration"
         const val COLUMN_FILE_SIZE = "file_size"
+        const val COLUMN_AI_SUMMARY = "ai_summary"
     }
 
     override fun onCreate(db: SQLiteDatabase) {
@@ -42,14 +44,20 @@ class DatabaseHelper(context: Context) : SQLiteOpenHelper(context, DATABASE_NAME
                 + "$COLUMN_DATE TEXT, "
                 + "$COLUMN_START_TIME TEXT, "
                 + "$COLUMN_DURATION TEXT, "
-                + "$COLUMN_FILE_SIZE TEXT)")
+                + "$COLUMN_FILE_SIZE TEXT, "
+                + "$COLUMN_AI_SUMMARY TEXT)")
         db.execSQL(createTableQuery)
         db.execSQL("CREATE INDEX IF NOT EXISTS idx_recordings_date ON $TABLE_RECORDINGS ($COLUMN_DATE)")
     }
 
     override fun onUpgrade(db: SQLiteDatabase, oldVersion: Int, newVersion: Int) {
-        db.execSQL("DROP TABLE IF EXISTS $TABLE_RECORDINGS")
-        onCreate(db)
+        if (oldVersion < 2) {
+            try {
+                db.execSQL("ALTER TABLE $TABLE_RECORDINGS ADD COLUMN $COLUMN_AI_SUMMARY TEXT")
+            } catch (e: Exception) {
+                Log.e(TAG, "Error upgrading table to v2 (adding $COLUMN_AI_SUMMARY)", e)
+            }
+        }
     }
 
     fun insertRecording(
@@ -127,6 +135,7 @@ class DatabaseHelper(context: Context) : SQLiteOpenHelper(context, DATABASE_NAME
                 val timeIndex = it.getColumnIndex(COLUMN_START_TIME)
                 val durationIndex = it.getColumnIndex(COLUMN_DURATION)
                 val sizeIndex = it.getColumnIndex(COLUMN_FILE_SIZE)
+                val aiSummaryIndex = it.getColumnIndex(COLUMN_AI_SUMMARY)
 
                 do {
                     val id = if (idIndex != -1) it.getLong(idIndex) else 0L
@@ -136,8 +145,9 @@ class DatabaseHelper(context: Context) : SQLiteOpenHelper(context, DATABASE_NAME
                     val startTime = if (timeIndex != -1) it.getString(timeIndex) else ""
                     val duration = if (durationIndex != -1) it.getString(durationIndex) else "00:00"
                     val fileSize = if (sizeIndex != -1) it.getString(sizeIndex) else "0 KB"
+                    val aiSummary = if (aiSummaryIndex != -1 && !it.isNull(aiSummaryIndex)) it.getString(aiSummaryIndex) else null
 
-                    recordings.add(RecordingModel(id, fileName, filePath, date, startTime, duration, fileSize))
+                    recordings.add(RecordingModel(id, fileName, filePath, date, startTime, duration, fileSize, aiSummary))
                 } while (it.moveToNext())
             }
         }
@@ -177,6 +187,20 @@ class DatabaseHelper(context: Context) : SQLiteOpenHelper(context, DATABASE_NAME
             rows > 0
         } catch (e: Exception) {
             Log.e(TAG, "Error updating recording $id", e)
+            false
+        }
+    }
+
+    fun updateRecordingAiSummary(id: Long, summary: String?): Boolean {
+        val db = this.writableDatabase
+        return try {
+            val values = ContentValues().apply {
+                put(COLUMN_AI_SUMMARY, summary)
+            }
+            val rows = db.update(TABLE_RECORDINGS, values, "$COLUMN_ID = ?", arrayOf(id.toString()))
+            rows > 0
+        } catch (e: Exception) {
+            Log.e(TAG, "Error updating AI summary for recording $id", e)
             false
         }
     }
