@@ -2,15 +2,76 @@ package com.example
 
 import android.content.Context
 import android.media.AudioAttributes
+import android.media.AudioFocusRequest
+import android.media.AudioManager
 import android.media.MediaPlayer
+import android.os.Build
 import android.util.Log
 import java.io.File
 import java.io.FileInputStream
 
 class AudioPlaybackManager(private val context: Context) {
     private var mediaPlayer: MediaPlayer? = null
+    private val audioManager = context.getSystemService(Context.AUDIO_SERVICE) as? AudioManager
+    private var audioFocusRequest: AudioFocusRequest? = null
+
     var onPlaybackStateChanged: ((isPlaying: Boolean, currentPosition: Int, duration: Int) -> Unit)? = null
     var onPlaybackCompleted: (() -> Unit)? = null
+
+    private val audioFocusChangeListener = AudioManager.OnAudioFocusChangeListener { focusChange ->
+        when (focusChange) {
+            AudioManager.AUDIOFOCUS_LOSS,
+            AudioManager.AUDIOFOCUS_LOSS_TRANSIENT -> {
+                pause()
+            }
+            AudioManager.AUDIOFOCUS_GAIN -> {
+                // Resume playback when focus is regained
+                resume()
+            }
+        }
+    }
+
+    private fun requestPlaybackAudioFocus(): Boolean {
+        return try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                val req = AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN_TRANSIENT_MAY_DUCK)
+                    .setAudioAttributes(
+                        AudioAttributes.Builder()
+                            .setUsage(AudioAttributes.USAGE_MEDIA)
+                            .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
+                            .build()
+                    )
+                    .setOnAudioFocusChangeListener(audioFocusChangeListener)
+                    .build()
+                audioFocusRequest = req
+                audioManager?.requestAudioFocus(req) == AudioManager.AUDIOFOCUS_REQUEST_GRANTED
+            } else {
+                @Suppress("DEPRECATION")
+                audioManager?.requestAudioFocus(
+                    audioFocusChangeListener,
+                    AudioManager.STREAM_MUSIC,
+                    AudioManager.AUDIOFOCUS_GAIN_TRANSIENT_MAY_DUCK
+                ) == AudioManager.AUDIOFOCUS_REQUEST_GRANTED
+            }
+        } catch (e: Exception) {
+            Log.w("AudioPlaybackManager", "Error requesting audio focus for playback", e)
+            true
+        }
+    }
+
+    private fun abandonPlaybackAudioFocus() {
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                audioFocusRequest?.let { audioManager?.abandonAudioFocusRequest(it) }
+                audioFocusRequest = null
+            } else {
+                @Suppress("DEPRECATION")
+                audioManager?.abandonAudioFocus(audioFocusChangeListener)
+            }
+        } catch (e: Exception) {
+            Log.w("AudioPlaybackManager", "Error abandoning audio focus", e)
+        }
+    }
 
     fun play(filePath: String, onProgress: (Int, Int) -> Unit) {
         val file = File(filePath)
@@ -20,6 +81,7 @@ class AudioPlaybackManager(private val context: Context) {
             return
         }
         stop()
+        requestPlaybackAudioFocus()
 
         var player: MediaPlayer? = null
         try {
@@ -31,10 +93,15 @@ class AudioPlaybackManager(private val context: Context) {
                     .build()
             )
 
-            // Using FileInputStream file descriptor is the most reliable way to play local files across all Android versions
-            val fis = FileInputStream(file)
-            player.setDataSource(fis.fd)
-            fis.close()
+            // Direct path first, fallback to duplicated fd
+            try {
+                player.setDataSource(file.absolutePath)
+            } catch (e: Exception) {
+                Log.w("AudioPlaybackManager", "Direct path failed, falling back to fd", e)
+                val fis = FileInputStream(file)
+                player.setDataSource(fis.fd, 0, file.length())
+                fis.close()
+            }
 
             player.setOnPreparedListener { prepared ->
                 try {
@@ -47,11 +114,13 @@ class AudioPlaybackManager(private val context: Context) {
             }
             player.setOnCompletionListener {
                 releasePlayer()
+                abandonPlaybackAudioFocus()
                 onPlaybackCompleted?.invoke()
             }
             player.setOnErrorListener { _, what, extra ->
                 Log.e("AudioPlaybackManager", "Playback error what=$what extra=$extra")
                 releasePlayer()
+                abandonPlaybackAudioFocus()
                 onPlaybackStateChanged?.invoke(false, 0, 0)
                 true
             }
@@ -61,6 +130,7 @@ class AudioPlaybackManager(private val context: Context) {
             Log.e("AudioPlaybackManager", "Could not play $filePath", e)
             try { player?.release() } catch (_: Exception) {}
             mediaPlayer = null
+            abandonPlaybackAudioFocus()
             onPlaybackStateChanged?.invoke(false, 0, 0)
         }
     }
@@ -76,6 +146,7 @@ class AudioPlaybackManager(private val context: Context) {
 
     fun resume() {
         try {
+            requestPlaybackAudioFocus()
             mediaPlayer?.let { if (!it.isPlaying) it.start() }
             emitState()
         } catch (e: Exception) {
@@ -90,6 +161,7 @@ class AudioPlaybackManager(private val context: Context) {
 
     fun stop() {
         releasePlayer()
+        abandonPlaybackAudioFocus()
         onPlaybackStateChanged?.invoke(false, 0, 0)
     }
 

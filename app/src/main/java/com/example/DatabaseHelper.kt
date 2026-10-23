@@ -205,6 +205,20 @@ class DatabaseHelper(context: Context) : SQLiteOpenHelper(context, DATABASE_NAME
         }
     }
 
+    fun updateRecordingPathByOldPath(oldFilePath: String, newFilePath: String): Boolean {
+        val db = this.writableDatabase
+        return try {
+            val values = ContentValues().apply {
+                put(COLUMN_FILE_PATH, newFilePath)
+            }
+            val rows = db.update(TABLE_RECORDINGS, values, "$COLUMN_FILE_PATH = ?", arrayOf(oldFilePath))
+            rows > 0
+        } catch (e: Exception) {
+            Log.e(TAG, "Error updating path by old path: $oldFilePath", e)
+            false
+        }
+    }
+
     fun deleteRecording(id: Long): Int {
         val db = this.writableDatabase
         return try {

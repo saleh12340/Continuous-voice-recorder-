@@ -1,6 +1,8 @@
 package com.example
 
 import android.content.Context
+import android.media.MediaScannerConnection
+import android.util.Log
 import java.io.File
 import java.text.SimpleDateFormat
 import java.util.Date
@@ -8,47 +10,71 @@ import java.util.Locale
 
 class RecordingRecoveryManager(private val context: Context, private val dbHelper: DatabaseHelper) {
 
+    companion object {
+        private const val TAG = "RecordingRecovery"
+    }
+
     fun performRecoveryScan(): Int {
         val fileManager = RecordingFileManager(context)
+
+        // 1. Migrate any legacy recordings from Android/data/ to the public Recordings directory
+        val migrated = fileManager.migrateLegacyInternalRecordings(dbHelper)
+        if (migrated > 0) {
+            Log.i(TAG, "Migrated $migrated recordings to public Files directory")
+        }
+
+        // 2. Scan public directory and sync database
         val rootDir = fileManager.getRootDirectory()
-        if (!rootDir.exists()) return 0
+        if (!rootDir.exists()) return migrated
 
         val existingRecords = dbHelper.getAllRecordings()
         val existingPaths = existingRecords.map { it.filePath }.toSet()
 
         var recoveredCount = 0
 
-        // Traverse date folders (YYYY-MM-DD)
-        rootDir.listFiles()?.forEach { dateFolder ->
-            if (dateFolder.isDirectory) {
-                val dateStr = dateFolder.name
-                dateFolder.listFiles()?.forEach { file ->
-                    if (file.isFile && file.length() > 0 && (file.name.endsWith(".m4a") || file.name.endsWith(".3gp") || file.name.endsWith(".aac"))) {
-                        val absolutePath = file.absolutePath
-                        if (!existingPaths.contains(absolutePath)) {
-                            // Missing from DB, recover it!
-                            val fileName = file.name
-                            val fileSizeFormatted = fileManager.formatFileSize(file.length())
-                            // Estimate duration roughly from file size if bitrate ~16kbps (2000 bytes per second)
-                            val estimatedDurationMs = (file.length() * 1000L) / 2000L
-                            val durationFormatted = formatDuration(estimatedDurationMs)
-                            val startTime = "00:00:00"
+        fun scanFolder(folder: File) {
+            folder.listFiles()?.forEach { file ->
+                if (file.isDirectory) {
+                    scanFolder(file)
+                } else if (file.isFile && file.length() > 256L &&
+                    (file.name.endsWith(".m4a", ignoreCase = true) ||
+                     file.name.endsWith(".3gp", ignoreCase = true) ||
+                     file.name.endsWith(".aac", ignoreCase = true))) {
 
-                            dbHelper.insertRecording(
-                                fileName = fileName,
-                                filePath = absolutePath,
-                                date = dateStr,
-                                startTime = startTime,
-                                duration = durationFormatted,
-                                fileSize = fileSizeFormatted
-                            )
-                            recoveredCount++
-                        }
+                    val absolutePath = file.absolutePath
+                    if (!existingPaths.contains(absolutePath)) {
+                        val fileName = file.name
+                        val fileSizeFormatted = fileManager.formatFileSize(file.length())
+                        // Approximate duration from file size if bitrate ~32kbps (4000 bytes per second)
+                        val estimatedDurationMs = (file.length() * 1000L) / 4000L
+                        val durationFormatted = formatDuration(estimatedDurationMs)
+                        val lastModified = file.lastModified()
+                        val dateStr = SimpleDateFormat("yyyy-MM-dd", Locale.US).format(Date(lastModified))
+                        val startTime = SimpleDateFormat("HH:mm:ss", Locale.US).format(Date(lastModified))
+
+                        dbHelper.insertRecording(
+                            fileName = fileName,
+                            filePath = absolutePath,
+                            date = dateStr,
+                            startTime = startTime,
+                            duration = durationFormatted,
+                            fileSize = fileSizeFormatted
+                        )
+
+                        MediaScannerConnection.scanFile(
+                            context,
+                            arrayOf(absolutePath),
+                            arrayOf(fileManager.getMimeTypeForExtension(file.extension)),
+                            null
+                        )
+                        recoveredCount++
                     }
                 }
             }
         }
-        return recoveredCount
+
+        scanFolder(rootDir)
+        return recoveredCount + migrated
     }
 
     private fun formatDuration(ms: Long): String {

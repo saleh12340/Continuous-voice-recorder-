@@ -47,6 +47,7 @@ class RecordingService : Service() {
     companion object {
         const val ACTION_START = "com.example.action.START_RECORDING"
         const val ACTION_STOP = "com.example.action.STOP_RECORDING"
+        const val ACTION_ROTATE_NOW = "com.example.action.ROTATE_NOW"
         const val ACTION_HEARTBEAT_CHECK = "com.example.action.HEARTBEAT_CHECK"
         private const val HEARTBEAT_INTERVAL_MS = 15 * 60 * 1000L // 15 minutes watchdog
         private const val CHANNEL_ID = "continuous_recording_channel"
@@ -58,15 +59,21 @@ class RecordingService : Service() {
         when (focusChange) {
             AudioManager.AUDIOFOCUS_LOSS,
             AudioManager.AUDIOFOCUS_LOSS_TRANSIENT -> {
-                Log.d(TAG, "Audio focus lost (incoming phone call or system audio). Saving segment safely...")
-                if (isRecording && !isPausedForCall) {
+                val mode = audioManager?.mode ?: AudioManager.MODE_NORMAL
+                val isRealPhoneCall = mode == AudioManager.MODE_IN_CALL ||
+                        mode == AudioManager.MODE_IN_COMMUNICATION ||
+                        mode == AudioManager.MODE_RINGTONE
+                Log.d(TAG, "Audio focus changed ($focusChange), mode=$mode (isRealPhoneCall=$isRealPhoneCall)")
+                // Only pause for actual phone calls; NEVER pause for playback or media
+                if (isRealPhoneCall && isRecording && !isPausedForCall) {
+                    Log.d(TAG, "Incoming telephone call active. Saving current segment...")
                     isPausedForCall = true
                     stopAndSaveCurrentSegment()
                     updateNotification("متوقف مؤقتاً أثناء المكالمة الهاتفية...")
                 }
             }
             AudioManager.AUDIOFOCUS_GAIN -> {
-                Log.d(TAG, "Audio focus regained (phone call ended). Resuming recording...")
+                Log.d(TAG, "Audio focus regained. Checking if paused for call...")
                 if (isPausedForCall) {
                     isPausedForCall = false
                     if (settings.isAutoResumeAfterCall()) {
@@ -96,6 +103,7 @@ class RecordingService : Service() {
         when (intent?.action) {
             ACTION_STOP -> stopRecordingService()
             ACTION_START -> startRecordingService()
+            ACTION_ROTATE_NOW -> rotateSegmentNow()
             ACTION_HEARTBEAT_CHECK -> {
                 if (isRecording) {
                     scheduleWatchdogHeartbeat()
@@ -123,7 +131,7 @@ class RecordingService : Service() {
 
         try {
             acquireWakeLock()
-            requestAudioFocus()
+            // Do not request AUDIOFOCUS_GAIN: MediaRecorder captures MIC input and must not block or be killed by audio playback
             startNewSegment()
             isRecording = true
             isPausedForCall = false
@@ -259,6 +267,22 @@ class RecordingService : Service() {
         handler.postDelayed(task, segmentDurationMs)
     }
 
+    private fun rotateSegmentNow() {
+        if (!isRecording) return
+        Log.d(TAG, "Immediate segment rotation requested (user requested listen or manual checkpoint)")
+        stopAndSaveCurrentSegment()
+        try {
+            startNewSegment()
+            RecordingStateHolder.onSegmentRotated(currentFileName, recordingStartTime)
+            val durationMin = settings.getSegmentDurationOption().minutes
+            updateNotification("التسجيل مستمر في الخلفية • تم تدوير المقطع")
+            scheduleNextSegment()
+            scheduleWatchdogHeartbeat()
+        } catch (e: Exception) {
+            Log.e(TAG, "Could not rotate recording segment immediately", e)
+        }
+    }
+
     private fun startNewSegment() {
         val format = settings.getSelectedAudioFormat()
         val file = fileManager.createNewSegmentFile(format.extension)
@@ -333,23 +357,31 @@ class RecordingService : Service() {
         recordingStartTime = 0L
         if (path.isBlank()) return
 
-        val file = File(path)
-        if (!file.isFile || file.length() < 256L) {
-            file.delete()
+        val stagingFile = File(path)
+        if (!stagingFile.isFile || stagingFile.length() < 256L) {
+            stagingFile.delete()
             return
         }
+
+        val format = settings.getSelectedAudioFormat()
+        val finalFile = fileManager.publishRecordingToPublicStorage(
+            sourceFile = stagingFile,
+            desiredFileName = name,
+            mimeType = format.mimeType
+        )
+
         val duration = (System.currentTimeMillis() - startedAt).coerceAtLeast(0L)
         val date = SimpleDateFormat("yyyy-MM-dd", Locale.US).format(Date(startedAt))
         val time = SimpleDateFormat("HH:mm:ss", Locale.US).format(Date(startedAt))
         val inserted = dbHelper.insertRecording(
-            fileName = name,
-            filePath = path,
+            fileName = finalFile.name,
+            filePath = finalFile.absolutePath,
             date = date,
             startTime = time,
             duration = formatDuration(duration),
-            fileSize = fileManager.formatFileSize(file.length())
+            fileSize = fileManager.formatFileSize(finalFile.length())
         )
-        if (inserted < 0L) Log.e(TAG, "Failed to save recording metadata for $path")
+        if (inserted < 0L) Log.e(TAG, "Failed to save recording metadata for ${finalFile.absolutePath}")
     }
 
     private fun stopRecordingService() {

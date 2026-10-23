@@ -4,6 +4,7 @@ import android.Manifest
 import android.content.ClipData
 import android.content.Context
 import android.content.Intent
+import android.media.MediaScannerConnection
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
@@ -657,17 +658,49 @@ fun AudioRecorderApp(
                 horizontalArrangement = Arrangement.SpaceBetween,
                 verticalAlignment = Alignment.CenterVertically
             ) {
-                Text(
-                    text = "التسجيلات المحفوظة (${recordingsList.size})",
-                    fontWeight = FontWeight.Bold,
-                    fontSize = 14.sp,
-                    color = Color(0xFF1E293B)
-                )
-                Text(
-                    text = "المستخدم: $totalStorageSize • المتاح: $freeStorageSpace",
-                    fontSize = 10.sp,
-                    color = Color(0xFF64748B)
-                )
+                Column {
+                    Text(
+                        text = "التسجيلات المحفوظة (${recordingsList.size})",
+                        fontWeight = FontWeight.Bold,
+                        fontSize = 14.sp,
+                        color = Color(0xFF1E293B)
+                    )
+                    Text(
+                        text = "المستخدم: $totalStorageSize • المتاح: $freeStorageSpace",
+                        fontSize = 10.sp,
+                        color = Color(0xFF64748B)
+                    )
+                }
+
+                FilledTonalButton(
+                    onClick = {
+                        val publicDir = fileManager.getRootDirectory()
+                        val friendlyPath = "Recordings/تسجيلاتي الصوتية"
+                        try {
+                            val intent = Intent(Intent.ACTION_VIEW).apply {
+                                val uri = FileProvider.getUriForFile(context, "${context.packageName}.fileprovider", publicDir)
+                                setDataAndType(uri, "resource/folder")
+                                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                            }
+                            context.startActivity(Intent.createChooser(intent, "فتح مجلد الملفات"))
+                        } catch (_: Exception) {
+                            try {
+                                val intent = Intent(Intent.ACTION_GET_CONTENT).apply {
+                                    type = "*/*"
+                                }
+                                context.startActivity(intent)
+                            } catch (_: Exception) {
+                                Toast.makeText(context, "المسار في تطبيق الملفات:\n$friendlyPath", Toast.LENGTH_LONG).show()
+                            }
+                        }
+                    },
+                    contentPadding = PaddingValues(horizontal = 10.dp, vertical = 6.dp),
+                    shape = RoundedCornerShape(8.dp)
+                ) {
+                    Icon(AppIcons.Folder, contentDescription = null, modifier = Modifier.size(16.dp))
+                    Spacer(modifier = Modifier.width(4.dp))
+                    Text("مجلد الملفات", fontSize = 11.sp)
+                }
             }
 
             // Recordings List
@@ -727,6 +760,7 @@ fun AudioRecorderApp(
                                 val file = File(item.filePath)
                                 if (file.exists()) {
                                     file.delete()
+                                    MediaScannerConnection.scanFile(context, arrayOf(file.absolutePath), null, null)
                                 }
                                 dbHelper.deleteRecording(item.id)
                                 refreshData()
@@ -831,6 +865,15 @@ fun AudioRecorderApp(
                         color = Color.DarkGray
                     )
 
+                    Divider()
+
+                    Text("مكان حفظ الملفات (تطبيق الملفات):", fontWeight = FontWeight.Bold, fontSize = 13.sp, color = Color(0xFF0D9488))
+                    Text(
+                        text = "تُحفظ التسجيلات مباشرة في المجلد العام (Recordings/تسجيلاتي الصوتية) في الذاكرة الرئيسية لتظهر في تطبيق 'الملفات' (مدير الملفات) وتطبيق الموسيقى، بعيداً عن مجلد Android المقيد.",
+                        fontSize = 11.sp,
+                        color = Color.DarkGray
+                    )
+
                     OutlinedButton(
                         onClick = {
                             try {
@@ -911,7 +954,9 @@ fun AudioRecorderApp(
                     Text("المدة الإجمالية: ${recording.duration}", fontSize = 12.sp)
                     Text("حجم الملف: ${recording.fileSize}", fontSize = 12.sp)
                     Text("التنسيق: ${if (recording.fileName.endsWith(".3gp")) "3GP (AMR-WB)" else "M4A (AAC-LC 32kbps Mono)"}", fontSize = 12.sp)
-                    Text("المسار على الذاكرة:", fontSize = 11.sp, fontWeight = FontWeight.Bold)
+                    Text("الموقع في تطبيق 'الملفات':", fontSize = 11.sp, fontWeight = FontWeight.Bold, color = Color(0xFF0284C7))
+                    Text("وحدة التخزين الرئيسية ⟵ Recordings ⟵ تسجيلاتي الصوتية", fontSize = 11.sp, color = Color(0xFF0369A1))
+                    Text("المسار الكامل على الذاكرة:", fontSize = 11.sp, fontWeight = FontWeight.Bold)
                     Text(recording.filePath, fontSize = 10.sp, color = Color.Gray)
                 }
             },
