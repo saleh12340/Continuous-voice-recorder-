@@ -9,6 +9,9 @@ import android.app.Service
 import android.content.Context
 import android.content.Intent
 import android.content.pm.ServiceInfo
+import android.media.AudioAttributes
+import android.media.AudioFocusRequest
+import android.media.AudioManager
 import android.media.MediaRecorder
 import android.os.Build
 import android.os.Handler
@@ -33,20 +36,51 @@ class RecordingService : Service() {
     private val handler = Handler(Looper.getMainLooper())
     private var segmentRunnable: Runnable? = null
     private var isRecording = false
+    private var isPausedForCall = false
+
     private lateinit var dbHelper: DatabaseHelper
     private lateinit var fileManager: RecordingFileManager
     private lateinit var settings: RecordingSettings
+    private var audioManager: AudioManager? = null
+    private var audioFocusRequest: AudioFocusRequest? = null
 
     companion object {
         const val ACTION_START = "com.example.action.START_RECORDING"
         const val ACTION_STOP = "com.example.action.STOP_RECORDING"
-        const val ACTION_STATUS = "com.example.action.RECORDING_STATUS"
         const val ACTION_HEARTBEAT_CHECK = "com.example.action.HEARTBEAT_CHECK"
-        const val SEGMENT_DURATION_MS = 30 * 60 * 1000L
         private const val HEARTBEAT_INTERVAL_MS = 15 * 60 * 1000L // 15 minutes watchdog
         private const val CHANNEL_ID = "continuous_recording_channel"
         private const val NOTIFICATION_ID = 101
         private const val TAG = "RecordingService"
+    }
+
+    private val audioFocusChangeListener = AudioManager.OnAudioFocusChangeListener { focusChange ->
+        when (focusChange) {
+            AudioManager.AUDIOFOCUS_LOSS,
+            AudioManager.AUDIOFOCUS_LOSS_TRANSIENT -> {
+                Log.d(TAG, "Audio focus lost (incoming phone call or system audio). Saving segment safely...")
+                if (isRecording && !isPausedForCall) {
+                    isPausedForCall = true
+                    stopAndSaveCurrentSegment()
+                    updateNotification("متوقف مؤقتاً أثناء المكالمة الهاتفية...")
+                }
+            }
+            AudioManager.AUDIOFOCUS_GAIN -> {
+                Log.d(TAG, "Audio focus regained (phone call ended). Resuming recording...")
+                if (isPausedForCall) {
+                    isPausedForCall = false
+                    if (settings.isAutoResumeAfterCall()) {
+                        try {
+                            startNewSegment()
+                            updateNotification("التسجيل مستمر في الخلفية")
+                            scheduleNextSegment()
+                        } catch (e: Exception) {
+                            Log.e(TAG, "Failed to resume recording after call", e)
+                        }
+                    }
+                }
+            }
+        }
     }
 
     override fun onCreate() {
@@ -54,6 +88,7 @@ class RecordingService : Service() {
         dbHelper = DatabaseHelper(this)
         fileManager = RecordingFileManager(this)
         settings = RecordingSettings(this)
+        audioManager = getSystemService(Context.AUDIO_SERVICE) as? AudioManager
         createNotificationChannel()
     }
 
@@ -79,7 +114,7 @@ class RecordingService : Service() {
             return
         }
 
-        val notification = createNotification("جارٍ بدء التسجيل...")
+        val notification = createNotification("جارٍ بدء التسجيل المستمر...")
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
             startForeground(NOTIFICATION_ID, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE)
         } else {
@@ -88,10 +123,13 @@ class RecordingService : Service() {
 
         try {
             acquireWakeLock()
+            requestAudioFocus()
             startNewSegment()
             isRecording = true
+            isPausedForCall = false
             RecordingStateHolder.onRecordingStarted(currentFileName, recordingStartTime)
-            updateNotification("التسجيل مستمر في الخلفية • تقسيم كل 30 دقيقة")
+            val durationMin = settings.getSegmentDurationOption().minutes
+            updateNotification("التسجيل مستمر في الخلفية • تقسيم كل $durationMin دقيقة")
             scheduleNextSegment()
             scheduleWatchdogHeartbeat()
         } catch (e: Exception) {
@@ -108,9 +146,49 @@ class RecordingService : Service() {
     private fun acquireWakeLock() {
         if (wakeLock?.isHeld == true) return
         val powerManager = getSystemService(Context.POWER_SERVICE) as PowerManager
-        wakeLock = powerManager.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "$packageName:ContinuousRecording").apply {
+        // Continuous partial wake lock to keep MediaRecorder alive during deep sleep on Infinix XOS
+        wakeLock = powerManager.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "InfinixContinuousRecorder:WakeLock").apply {
             setReferenceCounted(false)
             acquire()
+        }
+    }
+
+    private fun requestAudioFocus() {
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                audioFocusRequest = AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN)
+                    .setAudioAttributes(
+                        AudioAttributes.Builder()
+                            .setUsage(AudioAttributes.USAGE_MEDIA)
+                            .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
+                            .build()
+                    )
+                    .setOnAudioFocusChangeListener(audioFocusChangeListener)
+                    .build()
+                audioManager?.requestAudioFocus(audioFocusRequest!!)
+            } else {
+                @Suppress("DEPRECATION")
+                audioManager?.requestAudioFocus(
+                    audioFocusChangeListener,
+                    AudioManager.STREAM_MUSIC,
+                    AudioManager.AUDIOFOCUS_GAIN
+                )
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "Error requesting audio focus", e)
+        }
+    }
+
+    private fun abandonAudioFocus() {
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                audioFocusRequest?.let { audioManager?.abandonAudioFocusRequest(it) }
+            } else {
+                @Suppress("DEPRECATION")
+                audioManager?.abandonAudioFocus(audioFocusChangeListener)
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "Error abandoning audio focus", e)
         }
     }
 
@@ -159,15 +237,17 @@ class RecordingService : Service() {
 
     private fun scheduleNextSegment() {
         segmentRunnable?.let(handler::removeCallbacks)
+        val segmentDurationMs = settings.getSegmentDurationOption().minutes * 60 * 1000L
+
         val task = object : Runnable {
             override fun run() {
-                if (!isRecording) return
+                if (!isRecording || isPausedForCall) return
                 stopAndSaveCurrentSegment()
                 try {
                     startNewSegment()
                     RecordingStateHolder.onSegmentRotated(currentFileName, recordingStartTime)
                     updateNotification("التسجيل مستمر في الخلفية • ملف جديد")
-                    handler.postDelayed(this, SEGMENT_DURATION_MS)
+                    handler.postDelayed(this, segmentDurationMs)
                     scheduleWatchdogHeartbeat()
                 } catch (e: Exception) {
                     Log.e(TAG, "Could not rotate recording segment", e)
@@ -176,29 +256,40 @@ class RecordingService : Service() {
             }
         }
         segmentRunnable = task
-        handler.postDelayed(task, SEGMENT_DURATION_MS)
+        handler.postDelayed(task, segmentDurationMs)
     }
 
     private fun startNewSegment() {
-        val quality = settings.getSelectedQualityMode()
-        val file = fileManager.createNewSegmentFile()
+        val format = settings.getSelectedAudioFormat()
+        val file = fileManager.createNewSegmentFile(format.extension)
         currentFilePath = file.absolutePath
         currentFileName = file.name
         recordingStartTime = System.currentTimeMillis()
 
-        val recorder = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) MediaRecorder(this) else {
+        val recorder = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            MediaRecorder(this)
+        } else {
             @Suppress("DEPRECATION")
             MediaRecorder()
         }
+
         try {
             recorder.apply {
                 setAudioSource(MediaRecorder.AudioSource.MIC)
-                setOutputFormat(MediaRecorder.OutputFormat.MPEG_4)
-                setAudioEncoder(MediaRecorder.AudioEncoder.AAC)
+                setOutputFormat(format.outputFormat)
+                setAudioEncoder(format.audioEncoder)
                 setAudioChannels(1)
-                setAudioEncodingBitRate(quality.bitrate)
-                setAudioSamplingRate(quality.sampleRate)
+                setAudioEncodingBitRate(format.bitrate)
+                setAudioSamplingRate(format.sampleRate)
                 setOutputFile(currentFilePath)
+
+                setOnErrorListener { _, what, extra ->
+                    Log.e(TAG, "MediaRecorder error: what=$what, extra=$extra")
+                }
+                setOnInfoListener { _, what, extra ->
+                    Log.d(TAG, "MediaRecorder info: what=$what, extra=$extra")
+                }
+
                 prepare()
                 start()
             }
@@ -216,6 +307,15 @@ class RecordingService : Service() {
     private fun stopAndSaveCurrentSegment() {
         val recorder = mediaRecorder ?: return
         mediaRecorder = null
+
+        // Android MediaRecorder requires at least ~1.5s of audio frames before stop() or it throws 'stop failed: -1007'
+        val elapsed = System.currentTimeMillis() - recordingStartTime
+        if (elapsed in 1..1500) {
+            try {
+                Thread.sleep(1500 - elapsed)
+            } catch (_: Exception) {}
+        }
+
         try {
             recorder.stop()
         } catch (e: RuntimeException) {
@@ -234,7 +334,7 @@ class RecordingService : Service() {
         if (path.isBlank()) return
 
         val file = File(path)
-        if (!file.isFile || file.length() < 512L) {
+        if (!file.isFile || file.length() < 256L) {
             file.delete()
             return
         }
@@ -254,11 +354,13 @@ class RecordingService : Service() {
 
     private fun stopRecordingService() {
         isRecording = false
+        isPausedForCall = false
         RecordingStateHolder.onRecordingStopped()
         segmentRunnable?.let(handler::removeCallbacks)
         segmentRunnable = null
         cancelWatchdogHeartbeat()
         stopAndSaveCurrentSegment()
+        abandonAudioFocus()
         releaseWakeLock()
         stopForeground(STOP_FOREGROUND_REMOVE)
         stopSelf()
@@ -288,8 +390,16 @@ class RecordingService : Service() {
 
     private fun createNotificationChannel() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            val channel = NotificationChannel(CHANNEL_ID, "التسجيل الصوتي المستمر", NotificationManager.IMPORTANCE_LOW)
-            (getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager).createNotificationChannel(channel)
+            val channel = NotificationChannel(
+                CHANNEL_ID,
+                "التسجيل الصوتي المستمر",
+                NotificationManager.IMPORTANCE_HIGH
+            ).apply {
+                description = "خدمة التسجيل الصوتي في الخلفية مع شاشة مطفأة"
+                setShowBadge(true)
+            }
+            val manager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+            manager.createNotificationChannel(channel)
         }
     }
 
@@ -311,7 +421,8 @@ class RecordingService : Service() {
             .setContentIntent(openPendingIntent)
             .addAction(android.R.drawable.ic_menu_close_clear_cancel, "إيقاف", stopPendingIntent)
             .setOngoing(isRecording || mediaRecorder != null)
-            .setOnlyAlertOnce(true)
+            .setPriority(NotificationCompat.PRIORITY_MAX)
+            .setCategory(NotificationCompat.CATEGORY_SERVICE)
             .build()
     }
 
@@ -326,11 +437,13 @@ class RecordingService : Service() {
 
     override fun onDestroy() {
         isRecording = false
+        isPausedForCall = false
         RecordingStateHolder.onRecordingStopped()
         segmentRunnable?.let(handler::removeCallbacks)
         segmentRunnable = null
         cancelWatchdogHeartbeat()
         stopAndSaveCurrentSegment()
+        abandonAudioFocus()
         releaseWakeLock()
         super.onDestroy()
     }

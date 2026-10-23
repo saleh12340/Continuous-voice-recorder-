@@ -3,9 +3,9 @@ package com.example
 import android.content.Context
 import android.media.AudioAttributes
 import android.media.MediaPlayer
-import android.net.Uri
 import android.util.Log
 import java.io.File
+import java.io.FileInputStream
 
 class AudioPlaybackManager(private val context: Context) {
     private var mediaPlayer: MediaPlayer? = null
@@ -14,12 +14,13 @@ class AudioPlaybackManager(private val context: Context) {
 
     fun play(filePath: String, onProgress: (Int, Int) -> Unit) {
         val file = File(filePath)
-        if (!file.isFile || !file.canRead() || file.length() < 512L) {
-            Log.w("AudioPlaybackManager", "File is missing, unreadable, or not finalized: $filePath")
+        if (!file.isFile || !file.canRead() || file.length() < 256L) {
+            Log.w("AudioPlaybackManager", "File is missing, unreadable, or empty: $filePath")
             onPlaybackStateChanged?.invoke(false, 0, 0)
             return
         }
         stop()
+
         var player: MediaPlayer? = null
         try {
             player = MediaPlayer()
@@ -29,11 +30,20 @@ class AudioPlaybackManager(private val context: Context) {
                     .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
                     .build()
             )
-            player.setDataSource(context, Uri.fromFile(file))
+
+            // Using FileInputStream file descriptor is the most reliable way to play local files across all Android versions
+            val fis = FileInputStream(file)
+            player.setDataSource(fis.fd)
+            fis.close()
+
             player.setOnPreparedListener { prepared ->
-                prepared.start()
-                onPlaybackStateChanged?.invoke(true, 0, prepared.duration)
-                onProgress(0, prepared.duration)
+                try {
+                    prepared.start()
+                    onPlaybackStateChanged?.invoke(true, 0, prepared.duration)
+                    onProgress(0, prepared.duration)
+                } catch (e: Exception) {
+                    Log.e("AudioPlaybackManager", "Start after prepared failed", e)
+                }
             }
             player.setOnCompletionListener {
                 releasePlayer()
@@ -86,8 +96,17 @@ class AudioPlaybackManager(private val context: Context) {
     private fun releasePlayer() {
         val old = mediaPlayer
         mediaPlayer = null
-        try { old?.setOnPreparedListener(null); old?.setOnCompletionListener(null); old?.setOnErrorListener(null) } catch (_: Exception) {}
-        try { old?.release() } catch (_: Exception) {}
+        try {
+            old?.setOnPreparedListener(null)
+            old?.setOnCompletionListener(null)
+            old?.setOnErrorListener(null)
+        } catch (_: Exception) {}
+        try {
+            if (old?.isPlaying == true) {
+                old.stop()
+            }
+            old?.release()
+        } catch (_: Exception) {}
     }
 
     private fun emitState() {

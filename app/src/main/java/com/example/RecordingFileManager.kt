@@ -34,10 +34,11 @@ class RecordingFileManager(private val context: Context) {
         return todayDir
     }
 
-    fun createNewSegmentFile(): File {
+    fun createNewSegmentFile(extension: String = ".m4a"): File {
         val todayDir = getTodayDirectory()
         val timeString = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.getDefault()).format(Date())
-        val fileName = "REC_$timeString.m4a"
+        val cleanExt = if (extension.startsWith(".")) extension else ".$extension"
+        val fileName = "REC_$timeString$cleanExt"
         return File(todayDir, fileName)
     }
 
@@ -45,8 +46,17 @@ class RecordingFileManager(private val context: Context) {
         val oldFile = File(oldFilePath)
         if (!oldFile.exists() || !oldFile.isFile) return null
 
-        val sanitized = newCustomName.trim().replace(Regex("[^a-zA-Z0-9_\\-\\u0600-\\u06FF]"), "_")
-        val finalFileName = if (sanitized.endsWith(".m4a", ignoreCase = true)) sanitized else "$sanitized.m4a"
+        val currentExt = if (oldFile.name.contains(".")) {
+            oldFile.name.substring(oldFile.name.lastIndexOf("."))
+        } else {
+            ".m4a"
+        }
+
+        var sanitized = newCustomName.trim().replace(Regex("[^a-zA-Z0-9_\\-\\u0600-\\u06FF]"), "_")
+        if (sanitized.endsWith(currentExt, ignoreCase = true)) {
+            sanitized = sanitized.substring(0, sanitized.length - currentExt.length)
+        }
+        val finalFileName = "$sanitized$currentExt"
         val newFile = File(oldFile.parentFile, finalFileName)
 
         return if (oldFile.renameTo(newFile)) {
