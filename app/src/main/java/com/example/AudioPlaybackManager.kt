@@ -1,8 +1,10 @@
 package com.example
 
 import android.content.Context
+import android.media.AudioAttributes
 import android.media.MediaPlayer
 import android.net.Uri
+import android.util.Log
 import java.io.File
 
 class AudioPlaybackManager(private val context: Context) {
@@ -12,90 +14,91 @@ class AudioPlaybackManager(private val context: Context) {
 
     fun play(filePath: String, onProgress: (Int, Int) -> Unit) {
         val file = File(filePath)
-        if (!file.exists()) return
-
+        if (!file.isFile || !file.canRead() || file.length() < 512L) {
+            Log.w("AudioPlaybackManager", "File is missing, unreadable, or not finalized: $filePath")
+            onPlaybackStateChanged?.invoke(false, 0, 0)
+            return
+        }
         stop()
-
+        var player: MediaPlayer? = null
         try {
-            mediaPlayer = MediaPlayer().apply {
-                setDataSource(context, Uri.fromFile(file))
-                prepare()
-                start()
-                setOnCompletionListener {
-                    stop()
-                    onPlaybackCompleted?.invoke()
-                }
+            player = MediaPlayer()
+            player.setAudioAttributes(
+                AudioAttributes.Builder()
+                    .setUsage(AudioAttributes.USAGE_MEDIA)
+                    .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
+                    .build()
+            )
+            player.setDataSource(context, Uri.fromFile(file))
+            player.setOnPreparedListener { prepared ->
+                prepared.start()
+                onPlaybackStateChanged?.invoke(true, 0, prepared.duration)
+                onProgress(0, prepared.duration)
             }
-            val duration = mediaPlayer?.duration ?: 0
-            onPlaybackStateChanged?.invoke(true, 0, duration)
+            player.setOnCompletionListener {
+                releasePlayer()
+                onPlaybackCompleted?.invoke()
+            }
+            player.setOnErrorListener { _, what, extra ->
+                Log.e("AudioPlaybackManager", "Playback error what=$what extra=$extra")
+                releasePlayer()
+                onPlaybackStateChanged?.invoke(false, 0, 0)
+                true
+            }
+            mediaPlayer = player
+            player.prepareAsync()
         } catch (e: Exception) {
-            e.printStackTrace()
-            stop()
+            Log.e("AudioPlaybackManager", "Could not play $filePath", e)
+            try { player?.release() } catch (_: Exception) {}
+            mediaPlayer = null
+            onPlaybackStateChanged?.invoke(false, 0, 0)
         }
     }
 
     fun pause() {
         try {
-            if (mediaPlayer?.isPlaying == true) {
-                mediaPlayer?.pause()
-                onPlaybackStateChanged?.invoke(false, mediaPlayer?.currentPosition ?: 0, mediaPlayer?.duration ?: 0)
-            }
+            mediaPlayer?.let { if (it.isPlaying) it.pause() }
+            emitState()
         } catch (e: Exception) {
-            e.printStackTrace()
+            Log.w("AudioPlaybackManager", "Pause failed", e)
         }
     }
 
     fun resume() {
         try {
-            if (mediaPlayer != null && mediaPlayer?.isPlaying == false) {
-                mediaPlayer?.start()
-                onPlaybackStateChanged?.invoke(true, mediaPlayer?.currentPosition ?: 0, mediaPlayer?.duration ?: 0)
-            }
+            mediaPlayer?.let { if (!it.isPlaying) it.start() }
+            emitState()
         } catch (e: Exception) {
-            e.printStackTrace()
+            Log.w("AudioPlaybackManager", "Resume failed", e)
         }
     }
 
     fun seekTo(positionMs: Int) {
-        try {
-            mediaPlayer?.seekTo(positionMs)
-        } catch (e: Exception) {
-            e.printStackTrace()
-        }
+        try { mediaPlayer?.seekTo(positionMs.coerceAtLeast(0)) }
+        catch (e: Exception) { Log.w("AudioPlaybackManager", "Seek failed", e) }
     }
 
     fun stop() {
-        try {
-            mediaPlayer?.stop()
-            mediaPlayer?.release()
-        } catch (e: Exception) {
-            e.printStackTrace()
-        }
-        mediaPlayer = null
+        releasePlayer()
         onPlaybackStateChanged?.invoke(false, 0, 0)
     }
 
-    fun isPlaying(): Boolean {
-        return try {
-            mediaPlayer?.isPlaying == true
-        } catch (e: Exception) {
-            false
-        }
+    private fun releasePlayer() {
+        val old = mediaPlayer
+        mediaPlayer = null
+        try { old?.setOnPreparedListener(null); old?.setOnCompletionListener(null); old?.setOnErrorListener(null) } catch (_: Exception) {}
+        try { old?.release() } catch (_: Exception) {}
     }
 
-    fun getCurrentPosition(): Int {
-        return try {
-            mediaPlayer?.currentPosition ?: 0
-        } catch (e: Exception) {
-            0
-        }
+    private fun emitState() {
+        val p = mediaPlayer
+        val playing = try { p?.isPlaying == true } catch (_: Exception) { false }
+        val position = try { p?.currentPosition ?: 0 } catch (_: Exception) { 0 }
+        val duration = try { p?.duration ?: 0 } catch (_: Exception) { 0 }
+        onPlaybackStateChanged?.invoke(playing, position, duration)
     }
 
-    fun getDuration(): Int {
-        return try {
-            mediaPlayer?.duration ?: 0
-        } catch (e: Exception) {
-            0
-        }
-    }
+    fun isPlaying(): Boolean = try { mediaPlayer?.isPlaying == true } catch (_: Exception) { false }
+    fun getCurrentPosition(): Int = try { mediaPlayer?.currentPosition ?: 0 } catch (_: Exception) { 0 }
+    fun getDuration(): Int = try { mediaPlayer?.duration ?: 0 } catch (_: Exception) { 0 }
 }
