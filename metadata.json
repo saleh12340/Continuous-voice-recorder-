@@ -1,0 +1,6 @@
+{
+  "name": "Background Audio Recorder",
+  "description": "Background audio recorder with 30-minute automatic segmentation, SQLite metadata storage, and built-in audio playback.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
